@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Register {
     RegFifo = 0x00,
     RegOpMode = 0x01,
@@ -15,6 +15,7 @@ pub enum Register {
     RegFifoTxBaseAddr = 0x0e,
     RegFifoRxBaseAddr = 0x0f,
     RegFifoRxCurrentAddr = 0x10,
+    RegIrqFlagsMask = 0x11,
     RegIrqFlags = 0x12,
     RegRxNbBytes = 0x13,
     RegPktSnrValue = 0x19,
@@ -39,47 +40,76 @@ pub enum Register {
     RegDioMapping1 = 0x40,
     RegVersion = 0x42,
     RegPaDac = 0x4d,
+    // RegNumeric(u8),
 }
-#[derive(Clone, Copy)]
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PaConfig {
     PaBoost = 0x80,
     PaOutputRfoPin = 0,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IRQ {
     IrqTxDoneMask = 0x08,
     IrqPayloadCrcErrorMask = 0x20,
     IrqRxDoneMask = 0x40,
+    //     /* 0x12 REG_IRQ_FLAGS */
+    // #define RFM_RXTIMEOUT               (1<<7) /* RX timeout */
+    // #define RFM_RXDONE                  (1<<6) /* Packet received */
+    // #define RFM_PAYLOADCRCERROR         (1<<5) /* Payload CRC fail */
+    // #define RFM_VALIDHEADER             (1<<4) /* Valid header received */
+    // #define RFM_TXDONE                  (1<<3) /* Finished transmitting */
+    // #define RFM_CADDONE                 (1<<2) /* CAD timed out */
+    // #define RFM_FHSSCHANGECHANNEL       (1<<1) /* FHSS hop time! */
+    // #define RFM_CADDETE
+}
+
+impl From<Register> for u8 {
+    fn from(mode: Register) -> Self {
+        mode.as_value()
+    }
 }
 
 impl Register {
-    pub fn addr(self) -> u8 {
+    pub fn as_value(self) -> u8 {
         self as u8
+    }
+}
+
+impl From<PaConfig> for u8 {
+    fn from(mode: PaConfig) -> Self {
+        mode.as_value()
     }
 }
 
 impl PaConfig {
-    pub fn addr(self) -> u8 {
+    pub fn as_value(self) -> u8 {
         self as u8
+    }
+}
+
+impl From<IRQ> for u8 {
+    fn from(mode: IRQ) -> Self {
+        mode.as_value()
     }
 }
 
 impl IRQ {
-    pub fn addr(self) -> u8 {
+    pub fn as_value(self) -> u8 {
         self as u8
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FskDataModulationShaping {
     None = 1,
     GaussianBt1d0 = 2,
     GaussianBt0d5 = 10,
-    GaussianBt0d3 = 11
+    GaussianBt0d3 = 11,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FskRampUpRamDown {
     #[allow(non_camel_case_types)]
     _3d4ms = 0b000,
@@ -97,5 +127,5 @@ pub enum FskRampUpRamDown {
     _20us = 0b1100,
     _15us = 0b1101,
     _12us = 0b1110,
-    _10us = 0b1111
+    _10us = 0b1111,
 }
