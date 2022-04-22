@@ -152,18 +152,18 @@ use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 
 mod register;
-use self::register::PaConfig;
-use self::register::Register;
-use self::register::Register::*;
-use self::register::IRQ;
+use register::{
+    FskDataModulationShaping, FskRampUpRamDown, PaConfig,
+    Register::{self, *},
+    IRQ,
+};
+use Error::*;
 
-/// Provides the necessary SPI mode configuration for the radio
 pub const MODE: Mode = Mode {
     phase: Phase::CaptureOnSecondTransition,
     polarity: Polarity::IdleHigh,
 };
 
-/// Provides high-level access to Semtech SX1276/77/78/79 based boards connected to a Raspberry Pi
 pub struct LoRa<SPI, CS, RESET> {
     spi: SPI,
     cs: CS,
@@ -183,14 +183,29 @@ pub enum Error<SPI, CS, RESET> {
     Transmitting,
 }
 
-use crate::register::{FskDataModulationShaping, FskRampUpRamDown};
-use Error::*;
-
 #[cfg(not(feature = "version_0x09"))]
 const VERSION_CHECK: u8 = 0x12;
 
 #[cfg(feature = "version_0x09")]
 const VERSION_CHECK: u8 = 0x09;
+
+/* 0x33 RegInvertIQ */
+const RFLR_INVERTIQ_RX_MASK: u8 = 0xBF;
+const RFLR_INVERTIQ_RX_OFF: u8 = 0x00;
+const RFLR_INVERTIQ_RX_ON: u8 = 0x40;
+const RFLR_INVERTIQ_TX_MASK: u8 = 0xFE;
+const RFLR_INVERTIQ_TX_OFF: u8 = 0x01;
+const RFLR_INVERTIQ_TX_ON: u8 = 0x00;
+
+/* 0x3b RegInvertIQ2 */
+const RFLR_INVERTIQ2_ON: u8 = 0x19;
+const RFLR_INVERTIQ2_OFF: u8 = 0x1D;
+
+/* 0x0c REG_LNA */
+const LNA_OFF_GAIN: u8 = 0x00;
+const LNA_MAX_G1: u8 = 1 << 5;
+const LNA_MAX_GAIN: u8 = 0x20;
+const LNA_BOOST: u8 = 0x03;
 
 impl<SPI, CS, RESET, E> LoRa<SPI, CS, RESET>
 where
@@ -229,8 +244,9 @@ where
             sx127x.write_register(RegFifoTxBaseAddr, 0)?;
             sx127x.write_register(RegFifoRxBaseAddr, 0)?;
 
-            let lna = sx127x.read_register(RegLna)?;
-            sx127x.write_register(RegLna, lna | 0x03)?;
+            // let lna = sx127x.read_register(RegLna)?;
+            // sx127x.write_register(RegLna, lna | 0x03)?;
+            sx127x.write_register(RegLna, LNA_MAX_GAIN)?;
 
             sx127x.write_register(RegModemConfig3, 0x04)?;
             // sx127x.write_register(RegModemConfig3, 0x0C)?; // for sf11-12
@@ -241,59 +257,6 @@ where
         } else {
             Err(Error::VersionMismatch(version))
         }
-    }
-
-    /// Lets owner of the driver struct to reconfigure the radio.  Takes care of resetting the
-    /// chip, putting it into a sleep mode and pulling CS high - thought he caller has to put if
-    /// back to some of the active modes himself
-    // pub fn configure<F>(
-    //     &mut self,
-    //     modifier: F,
-    //     delay: &mut dyn DelayMs<u8>,
-    // ) -> Result<(), Error<E, CS::Error, RESET::Error>>
-    // where
-    //     F: FnOnce(&mut Self) -> Result<(), Error<E, CS::Error, RESET::Error>>,
-    // {
-    //     self.reset(delay)?;
-    //     self.set_mode(RadioMode::Sleep)?;
-    //     modifier(self)?;
-    //     self.cs.set_high().map_err(CS)?;
-    //     Ok(())
-    // }
-
-    /// Transmits up to 255 bytes of data. To avoid the use of an allocator, this takes a fixed 255 u8
-    /// array and a payload size and returns the number of bytes sent if successful.
-    pub fn transmit_payload_busy(
-        &mut self,
-        buffer: [u8; 255],
-        payload_size: usize,
-    ) -> Result<usize, Error<E, CS::Error, RESET::Error>> {
-        if self.transmitting()? {
-            Err(Transmitting)
-        } else {
-            self.set_mode(RadioMode::Stdby)?;
-            if self.explicit_header {
-                self.set_explicit_header_mode()?;
-            } else {
-                self.set_implicit_header_mode()?;
-            }
-
-            self.write_register(RegIrqFlags, 0)?;
-            self.write_register(RegFifoAddrPtr, 0)?;
-            self.write_register(RegPayloadLength, 0)?;
-            for byte in buffer.iter().take(payload_size) {
-                self.write_register(RegFifo, *byte)?;
-            }
-            self.write_register(RegPayloadLength, payload_size as u8)?;
-            self.set_mode(RadioMode::Tx)?;
-
-            while self.transmitting()? {}
-            Ok(payload_size)
-        }
-    }
-
-    pub fn set_dio0_tx_done(&mut self) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        self.write_register(RegDioMapping1, 0b01_00_00_00)
     }
 
     pub fn transmit_payload(
@@ -311,13 +274,11 @@ where
             }
 
             self.write_register(RegIrqFlags, 0xff)?;
-            self.write_register(RegIrqFlagsMask, IRQ::IrqTxDoneMask.as_value() ^ 0xff)?;
-
+            self.write_register(RegIrqFlagsMask, IRQ::TxDone.as_value() ^ 0xff)?;
             self.write_register(RegDioMapping1, 0x40 | 0x30 | 0xc0)?;
 
             let base_ad = self.read_register(RegFifoRxBaseAddr)?;
             self.write_register(RegFifoAddrPtr, base_ad)?;
-            // self.write_register(RegPayloadLength, 0)?;
             self.write_register(RegPayloadLength, payload.len().min(255) as u8)?;
 
             for &byte in payload.iter().take(255) {
@@ -329,6 +290,21 @@ where
             while self.transmitting()? {}
             Ok(())
         }
+    }
+
+    /// Todo: replace this and `poll_irq` for something sane!
+    /// Short wait for validheader and some time for receiving
+    pub fn my_rx(&mut self, timeout_ms: Option<i32>, delay: &mut dyn DelayMs<u8>) 
+    -> Result<usize, Error<E, CS::Error, RESET::Error>> {
+
+        self.write_register(RegIrqFlags, 0xff)?;
+        self.write_register(RegIrqFlagsMask, (IRQ::ValidHeader as u8 | IRQ::RxDone as u8) ^ 0xff)?;
+        // self.write_register(REG_DIO_MAPPING_1, DIO0(00) | DIO1(3) | DIO2(3) | DIO3(1)); // Valid header (dio2) and rxdone (dio0)
+
+        let base_ad = self.read_register(RegFifoRxBaseAddr)?;
+        self.write_register(RegFifoAddrPtr, base_ad)?;
+
+        self.poll_irq(timeout_ms, delay)
     }
 
     /// Blocks the current thread, returning the size of a packet if one is received or an error is the
@@ -344,7 +320,9 @@ where
             Some(value) => {
                 let mut count = 0;
                 let packet_ready = loop {
-                    let packet_ready = self.read_register(RegIrqFlags)?.get_bit(6);
+                    let irq_flags = self.read_register(RegIrqFlags)?;
+                    let packet_ready = irq_flags.get_bit(6); // valid headeR: | irq_flags.get_bit(4);
+
                     if count >= value || packet_ready {
                         break packet_ready;
                     }
@@ -397,8 +375,8 @@ where
         if (op_mode == RadioMode::Tx.as_value()) || (op_mode == RadioMode::FsTx.as_value()) {
             Ok(true)
         } else {
-            if (self.read_register(RegIrqFlags)? & (IRQ::IrqTxDoneMask as u8)) == 1 {
-                self.write_register(RegIrqFlags, IRQ::IrqTxDoneMask as u8)?;
+            if (self.read_register(RegIrqFlags)? & (IRQ::TxDone as u8)) == 1 {
+                self.write_register(RegIrqFlags, IRQ::TxDone as u8)?;
             }
             Ok(false)
         }
@@ -512,7 +490,7 @@ where
     /// Sets the spreading factor of the radio. Supported values are between 6 and 12.
     /// If a spreading factor of 6 is set, implicit header mode must be used to transmit
     /// and receive packets. Default value is `7`.
-    pub fn set_spreading_factor(
+    pub fn set_spread_factor(
         &mut self,
         mut sf: u8,
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
@@ -560,7 +538,7 @@ where
         };
 
         if bw == 9 {
-            if self.freq_hz < 525 {
+            if self.freq_hz < 525_000_000 {
                 self.write_register(RegHighBWOptimize1, 0x02)?;
                 self.write_register(RegHighBWOptimize2, 0x7f)?;
             } else {
@@ -615,15 +593,61 @@ where
         }
     }
 
-    /// Inverts the radio's IQ signals. Default value is `false`.
-    pub fn set_invert_iq(&mut self, value: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        if value {
-            self.write_register(RegInvertiq, 0x66)?;
-            self.write_register(RegInvertiq2, 0x19)
+    // /// Inverts the radio's IQ signals. Default value is `false`.
+    // pub fn set_invert_iq(&mut self, value: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+    //     if value {
+    //         self.write_register(RegInvertiq, 0x66)?;
+    //         self.write_register(RegInvertiq2, 0x19)
+    //     } else {
+    //         self.write_register(RegInvertiq, 0x27)?;
+    //         self.write_register(RegInvertiq2, 0x1d)
+    //     }
+    // }
+
+    pub fn invert_rx_iq(&mut self, inv: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+        let mut regiq =
+            self.read_register(RegInvertiq)? & RFLR_INVERTIQ_TX_MASK & RFLR_INVERTIQ_RX_MASK;
+
+        if inv {
+            regiq |= RFLR_INVERTIQ_RX_ON | RFLR_INVERTIQ_TX_OFF;
         } else {
-            self.write_register(RegInvertiq, 0x27)?;
-            self.write_register(RegInvertiq2, 0x1d)
+            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_OFF;
         }
+
+        self.write_register(RegInvertiq, regiq)?;
+        self.write_register(
+            RegInvertiq2,
+            if inv {
+                RFLR_INVERTIQ2_ON
+            } else {
+                RFLR_INVERTIQ2_OFF
+            },
+        )?;
+
+        Ok(())
+    }
+
+    pub fn invert_tx_iq(&mut self, inv: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+        let mut regiq =
+            self.read_register(RegInvertiq)? & RFLR_INVERTIQ_TX_MASK & RFLR_INVERTIQ_RX_MASK;
+
+        if inv {
+            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_ON;
+        } else {
+            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_OFF;
+        }
+
+        self.write_register(RegInvertiq, regiq)?;
+        self.write_register(
+            RegInvertiq2,
+            if inv {
+                RFLR_INVERTIQ2_ON
+            } else {
+                RFLR_INVERTIQ2_OFF
+            },
+        )?;
+
+        Ok(())
     }
 
     /// Returns the spreading factor of the radio.

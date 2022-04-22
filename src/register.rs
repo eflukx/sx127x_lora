@@ -40,7 +40,6 @@ pub enum Register {
     RegDioMapping1 = 0x40,
     RegVersion = 0x42,
     RegPaDac = 0x4d,
-    // RegNumeric(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,18 +50,14 @@ pub enum PaConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IRQ {
-    IrqTxDoneMask = 0x08,
-    IrqPayloadCrcErrorMask = 0x20,
-    IrqRxDoneMask = 0x40,
-    //     /* 0x12 REG_IRQ_FLAGS */
-    // #define RFM_RXTIMEOUT               (1<<7) /* RX timeout */
-    // #define RFM_RXDONE                  (1<<6) /* Packet received */
-    // #define RFM_PAYLOADCRCERROR         (1<<5) /* Payload CRC fail */
-    // #define RFM_VALIDHEADER             (1<<4) /* Valid header received */
-    // #define RFM_TXDONE                  (1<<3) /* Finished transmitting */
-    // #define RFM_CADDONE                 (1<<2) /* CAD timed out */
-    // #define RFM_FHSSCHANGECHANNEL       (1<<1) /* FHSS hop time! */
-    // #define RFM_CADDETE
+    RxTimeOut = (1 << 7),
+    RxDone = (1 << 6),
+    PayloadCrcError = (1 << 5),
+    ValidHeader = (1 << 4),
+    TxDone = (1 << 3),
+    CadDone = (1 << 2),
+    FHSSChangeChannel = (1 << 1),
+    CadDetected = (1 << 0),
 }
 
 impl From<Register> for u8 {
