@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use core::convert::TryFrom;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Register {
     RegFifo = 0x00,
@@ -42,24 +44,6 @@ pub enum Register {
     RegPaDac = 0x4d,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PaConfig {
-    PaBoost = 0x80,
-    PaOutputRfoPin = 0,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum IRQ {
-    RxTimeOut = (1 << 7),
-    RxDone = (1 << 6),
-    PayloadCrcError = (1 << 5),
-    ValidHeader = (1 << 4),
-    TxDone = (1 << 3),
-    CadDone = (1 << 2),
-    FHSSChangeChannel = (1 << 1),
-    CadDetected = (1 << 0),
-}
-
 impl From<Register> for u8 {
     fn from(mode: Register) -> Self {
         mode.as_value()
@@ -72,6 +56,55 @@ impl Register {
     }
 }
 
+/// Modes of the radio and their corresponding register values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadioMode {
+    LongRangeMode = 0x80,
+    Sleep = 0x00,
+    Stdby = 0x01,
+    FsTx = 0x02,
+    Tx = 0x03,
+    RxContinuous = 0x05,
+    RxSingle = 0x06,
+}
+
+impl From<RadioMode> for u8 {
+    fn from(mode: RadioMode) -> Self {
+        mode.as_value()
+    }
+}
+
+impl RadioMode {
+    /// Returns the address of the mode.
+    pub fn as_value(self) -> u8 {
+        self as u8
+    }
+}
+
+/* 0x33 RegInvertIQ */
+pub(crate) const RFLR_INVERTIQ_RX_MASK: u8 = 0xBF;
+pub(crate) const RFLR_INVERTIQ_RX_OFF: u8 = 0x00;
+pub(crate) const RFLR_INVERTIQ_RX_ON: u8 = 0x40;
+pub(crate) const RFLR_INVERTIQ_TX_MASK: u8 = 0xFE;
+pub(crate) const RFLR_INVERTIQ_TX_OFF: u8 = 0x01;
+pub(crate) const RFLR_INVERTIQ_TX_ON: u8 = 0x00;
+
+/* 0x3b RegInvertIQ2 */
+pub(crate) const RFLR_INVERTIQ2_ON: u8 = 0x19;
+pub(crate) const RFLR_INVERTIQ2_OFF: u8 = 0x1D;
+
+/* 0x0c REG_LNA */
+pub(crate) const LNA_OFF_GAIN: u8 = 0x00;
+pub(crate) const LNA_MAX_G1: u8 = 1 << 5;
+pub(crate) const LNA_MAX_GAIN: u8 = 0x20;
+pub(crate) const LNA_BOOST: u8 = 0x03;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaConfig {
+    PaBoost = 0x80,
+    PaOutputRfoPin = 0,
+}
+
 impl From<PaConfig> for u8 {
     fn from(mode: PaConfig) -> Self {
         mode.as_value()
@@ -82,6 +115,18 @@ impl PaConfig {
     pub fn as_value(self) -> u8 {
         self as u8
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IRQ {
+    RxTimeOut = (1 << 7),
+    RxDone = (1 << 6),
+    PayloadCrcError = (1 << 5),
+    ValidHeader = (1 << 4),
+    TxDone = (1 << 3),
+    CadDone = (1 << 2),
+    FHSSChangeChannel = (1 << 1),
+    CadDetected = (1 << 0),
 }
 
 impl From<IRQ> for u8 {
@@ -123,4 +168,55 @@ pub enum FskRampUpRamDown {
     _15us = 0b1101,
     _12us = 0b1110,
     _10us = 0b1111,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BwSetting {
+    Bw7_8kHz = 0b0000,
+    Bw10_4kHz = 0b0001,
+    Bw15_6kHz = 0b0010,
+    Bw20_8kHz = 0b0011,
+    Bw31_25kHz = 0b0100,
+    Bw41_7kHz = 0b0101,
+    Bw62_5kHz = 0b0110,
+    Bw125kHz = 0b0111,
+    Bw250kHz = 0b1000,
+    Bw500kHz = 0b1001,
+}
+
+impl BwSetting {
+    pub fn as_hz(&self) -> u32 {
+        match self {
+            BwSetting::Bw7_8kHz => 7_800,
+            BwSetting::Bw10_4kHz => 10_400,
+            BwSetting::Bw15_6kHz => 15_600,
+            BwSetting::Bw20_8kHz => 20_800,
+            BwSetting::Bw31_25kHz => 31_250,
+            BwSetting::Bw41_7kHz => 41_700,
+            BwSetting::Bw62_5kHz => 62_500,
+            BwSetting::Bw125kHz => 125_000,
+            BwSetting::Bw250kHz => 250_000,
+            BwSetting::Bw500kHz => 500_000,
+        }
+    }
+}
+
+impl TryFrom<u8> for BwSetting {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Bw7_8kHz),
+            1 => Ok(Self::Bw10_4kHz),
+            2 => Ok(Self::Bw15_6kHz),
+            3 => Ok(Self::Bw20_8kHz),
+            4 => Ok(Self::Bw31_25kHz),
+            5 => Ok(Self::Bw41_7kHz),
+            6 => Ok(Self::Bw62_5kHz),
+            7 => Ok(Self::Bw125kHz),
+            8 => Ok(Self::Bw250kHz),
+            9 => Ok(Self::Bw500kHz),
+            _ => Err(()),
+        }
+    }
 }

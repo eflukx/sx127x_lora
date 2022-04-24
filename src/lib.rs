@@ -145,6 +145,8 @@
 //! support is available in `embedded-hal`, then this will be added. It is possible to implement this function on a
 //! device-to-device basis by retrieving a packet with the `read_packet()` function.
 
+use core::convert::TryFrom;
+
 use bit_field::BitField;
 use embedded_hal::blocking::delay::DelayMs;
 use embedded_hal::blocking::spi::{Transfer, Write};
@@ -152,11 +154,12 @@ use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 
 mod register;
+pub use register::{BwSetting, FskDataModulationShaping, FskRampUpRamDown, PaConfig, RadioMode};
 use register::{
-    FskDataModulationShaping, FskRampUpRamDown, PaConfig,
     Register::{self, *},
     IRQ,
 };
+
 use Error::*;
 
 pub const MODE: Mode = Mode {
@@ -181,6 +184,7 @@ pub enum Error<SPI, CS, RESET> {
     Reset(RESET),
     SPI(SPI),
     Transmitting,
+    IllegalBwSetting,
 }
 
 #[cfg(not(feature = "version_0x09"))]
@@ -188,24 +192,6 @@ const VERSION_CHECK: u8 = 0x12;
 
 #[cfg(feature = "version_0x09")]
 const VERSION_CHECK: u8 = 0x09;
-
-/* 0x33 RegInvertIQ */
-const RFLR_INVERTIQ_RX_MASK: u8 = 0xBF;
-const RFLR_INVERTIQ_RX_OFF: u8 = 0x00;
-const RFLR_INVERTIQ_RX_ON: u8 = 0x40;
-const RFLR_INVERTIQ_TX_MASK: u8 = 0xFE;
-const RFLR_INVERTIQ_TX_OFF: u8 = 0x01;
-const RFLR_INVERTIQ_TX_ON: u8 = 0x00;
-
-/* 0x3b RegInvertIQ2 */
-const RFLR_INVERTIQ2_ON: u8 = 0x19;
-const RFLR_INVERTIQ2_OFF: u8 = 0x1D;
-
-/* 0x0c REG_LNA */
-const LNA_OFF_GAIN: u8 = 0x00;
-const LNA_MAX_G1: u8 = 1 << 5;
-const LNA_MAX_GAIN: u8 = 0x20;
-const LNA_BOOST: u8 = 0x03;
 
 impl<SPI, CS, RESET, E> LoRa<SPI, CS, RESET>
 where
@@ -246,7 +232,7 @@ where
 
             // let lna = sx127x.read_register(RegLna)?;
             // sx127x.write_register(RegLna, lna | 0x03)?;
-            sx127x.write_register(RegLna, LNA_MAX_GAIN)?;
+            sx127x.write_register(RegLna, register::LNA_MAX_GAIN)?;
 
             sx127x.write_register(RegModemConfig3, 0x04)?;
             // sx127x.write_register(RegModemConfig3, 0x0C)?; // for sf11-12
@@ -294,11 +280,16 @@ where
 
     /// Todo: replace this and `poll_irq` for something sane!
     /// Short wait for validheader and some time for receiving
-    pub fn my_rx(&mut self, timeout_ms: Option<i32>, delay: &mut dyn DelayMs<u8>) 
-    -> Result<usize, Error<E, CS::Error, RESET::Error>> {
-
+    pub fn my_rx(
+        &mut self,
+        timeout_ms: Option<i32>,
+        delay: &mut dyn DelayMs<u8>,
+    ) -> Result<usize, Error<E, CS::Error, RESET::Error>> {
         self.write_register(RegIrqFlags, 0xff)?;
-        self.write_register(RegIrqFlagsMask, (IRQ::ValidHeader as u8 | IRQ::RxDone as u8) ^ 0xff)?;
+        self.write_register(
+            RegIrqFlagsMask,
+            (IRQ::ValidHeader as u8 | IRQ::RxDone as u8) ^ 0xff,
+        )?;
         // self.write_register(REG_DIO_MAPPING_1, DIO0(00) | DIO1(3) | DIO2(3) | DIO3(1)); // Valid header (dio2) and rxdone (dio0)
 
         let base_ad = self.read_register(RegFifoRxBaseAddr)?;
@@ -463,12 +454,18 @@ where
 
     /// Sets the frequency of the radio. Values are in Hertz.
     ///
-    pub fn set_frequency(&mut self, freq_hz: i64) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+    pub fn set_frequency(
+        &mut self,
+        freq_hz: i64,
+    ) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
         self.freq_hz = freq_hz;
         let frf = (freq_hz << 19) / 32_000_000;
         self.write_register(RegFrfMsb, ((frf >> 16) & 0xff) as u8)?;
         self.write_register(RegFrfMid, ((frf >> 8) & 0xff) as u8)?;
-        self.write_register(RegFrfLsb, ((frf >> 0) & 0xff) as u8)
+        self.write_register(RegFrfLsb, ((frf >> 0) & 0xff) as u8)?;
+
+        let actual = (frf * 32_000_000) >> 19;
+        Ok(actual as u32)
     }
 
     /// Sets the radio to use an explicit header. Default state is `ON`.
@@ -493,7 +490,7 @@ where
     pub fn set_spread_factor(
         &mut self,
         mut sf: u8,
-    ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+    ) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
         if sf < 6 {
             sf = 6;
         } else if sf > 12 {
@@ -513,7 +510,7 @@ where
             (modem_config_2 & 0x0f) | ((sf << 4) & 0xf0),
         )?;
         self.set_ldo_flag()?;
-        Ok(())
+        Ok(sf) // actual SF
     }
 
     /// Sets the signal bandwidth of the radio. Supported values are: `7800 Hz`, `10400 Hz`,
@@ -522,22 +519,9 @@ where
     /// See p. 4 of SX1276_77_8_ErrataNote_1.1_STD.pdf for Errata implemetation
     pub fn set_signal_bandwidth(
         &mut self,
-        sbw: i64,
+        bw: BwSetting,
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        let bw: i64 = match sbw {
-            7_800 => 0,
-            10_400 => 1,
-            15_600 => 2,
-            20_800 => 3,
-            31_250 => 4,
-            41_700 => 5,
-            62_500 => 6,
-            125_000 => 7,
-            250_000 => 8,
-            _ => 9,
-        };
-
-        if bw == 9 {
+        if bw == BwSetting::Bw500kHz {
             if self.freq_hz < 525_000_000 {
                 self.write_register(RegHighBWOptimize1, 0x02)?;
                 self.write_register(RegHighBWOptimize2, 0x7f)?;
@@ -551,7 +535,7 @@ where
         }
 
         let modem_config_1 = self.read_register(RegModemConfig1)?;
-        self.write_register(RegModemConfig1, (modem_config_1 & 0x0f) | ((bw << 4) as u8))?;
+        self.write_register(RegModemConfig1, (modem_config_1 & 0x0f) | ((bw as u8) << 4))?;
         self.set_ldo_flag()?;
         Ok(())
     }
@@ -605,22 +589,23 @@ where
     // }
 
     pub fn invert_rx_iq(&mut self, inv: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        let mut regiq =
-            self.read_register(RegInvertiq)? & RFLR_INVERTIQ_TX_MASK & RFLR_INVERTIQ_RX_MASK;
+        let mut regiq = self.read_register(RegInvertiq)?
+            & register::RFLR_INVERTIQ_TX_MASK
+            & register::RFLR_INVERTIQ_RX_MASK;
 
         if inv {
-            regiq |= RFLR_INVERTIQ_RX_ON | RFLR_INVERTIQ_TX_OFF;
+            regiq |= register::RFLR_INVERTIQ_RX_ON | register::RFLR_INVERTIQ_TX_OFF;
         } else {
-            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_OFF;
+            regiq |= register::RFLR_INVERTIQ_RX_OFF | register::RFLR_INVERTIQ_TX_OFF;
         }
 
         self.write_register(RegInvertiq, regiq)?;
         self.write_register(
             RegInvertiq2,
             if inv {
-                RFLR_INVERTIQ2_ON
+                register::RFLR_INVERTIQ2_ON
             } else {
-                RFLR_INVERTIQ2_OFF
+                register::RFLR_INVERTIQ2_OFF
             },
         )?;
 
@@ -628,22 +613,23 @@ where
     }
 
     pub fn invert_tx_iq(&mut self, inv: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        let mut regiq =
-            self.read_register(RegInvertiq)? & RFLR_INVERTIQ_TX_MASK & RFLR_INVERTIQ_RX_MASK;
+        let mut regiq = self.read_register(RegInvertiq)?
+            & register::RFLR_INVERTIQ_TX_MASK
+            & register::RFLR_INVERTIQ_RX_MASK;
 
         if inv {
-            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_ON;
+            regiq |= register::RFLR_INVERTIQ_RX_OFF | register::RFLR_INVERTIQ_TX_ON;
         } else {
-            regiq |= RFLR_INVERTIQ_RX_OFF | RFLR_INVERTIQ_TX_OFF;
+            regiq |= register::RFLR_INVERTIQ_RX_OFF | register::RFLR_INVERTIQ_TX_OFF;
         }
 
         self.write_register(RegInvertiq, regiq)?;
         self.write_register(
             RegInvertiq2,
             if inv {
-                RFLR_INVERTIQ2_ON
+                register::RFLR_INVERTIQ2_ON
             } else {
-                RFLR_INVERTIQ2_OFF
+                register::RFLR_INVERTIQ2_OFF
             },
         )?;
 
@@ -656,21 +642,10 @@ where
     }
 
     /// Returns the signal bandwidth of the radio.
-    pub fn get_signal_bandwidth(&mut self) -> Result<i64, Error<E, CS::Error, RESET::Error>> {
-        let bw = self.read_register(RegModemConfig1)? >> 4;
-        let bw = match bw {
-            0 => 7_800,
-            1 => 10_400,
-            2 => 15_600,
-            3 => 20_800,
-            4 => 31_250,
-            5 => 41_700,
-            6 => 62_500,
-            7 => 125_000,
-            8 => 250_000,
-            9 => 500_000,
-            _ => -1,
-        };
+    pub fn get_signal_bandwidth(&mut self) -> Result<BwSetting, Error<E, CS::Error, RESET::Error>> {
+        let regval = self.read_register(RegModemConfig1)? >> 4;
+        let bw = BwSetting::try_from(regval).map_err(|_| Error::IllegalBwSetting)?;
+
         Ok(bw)
     }
 
@@ -695,12 +670,12 @@ where
 
         let f_xtal = 32_000_000; // FXOSC: crystal oscillator (XTAL) frequency (2.5. Chip Specification, p. 14)
         let f_error = ((f64::from(freq_error) * (1i64 << 24) as f64) / f64::from(f_xtal))
-            * (self.get_signal_bandwidth()? as f64 / 500_000.0f64); // p. 37
+            * (self.get_signal_bandwidth()?.as_hz() as f64 / 500_000.0f64); // p. 37
         Ok(f_error as i64)
     }
 
     fn set_ldo_flag(&mut self) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        let sw = self.get_signal_bandwidth()?;
+        let sw = self.get_signal_bandwidth()?.as_hz() as i64;
         // Section 4.1.1.5
         let symbol_duration = 1000 / (sw / ((1 as i64) << self.get_spreading_factor()?));
 
@@ -757,29 +732,5 @@ where
             .set_bits(0..3, ramp as u8);
 
         self.write_register(RegPaRamp, pa_ramp)
-    }
-}
-/// Modes of the radio and their corresponding register values.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RadioMode {
-    LongRangeMode = 0x80,
-    Sleep = 0x00,
-    Stdby = 0x01,
-    FsTx = 0x02,
-    Tx = 0x03,
-    RxContinuous = 0x05,
-    RxSingle = 0x06,
-}
-
-impl From<RadioMode> for u8 {
-    fn from(mode: RadioMode) -> Self {
-        mode.as_value()
-    }
-}
-
-impl RadioMode {
-    /// Returns the address of the mode.
-    pub fn as_value(self) -> u8 {
-        self as u8
     }
 }
