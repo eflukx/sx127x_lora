@@ -24,7 +24,7 @@
 
 //! const LORA_CS_PIN: u64 = 8;
 //! const LORA_RESET_PIN: u64 = 21;
-//! const FREQUENCY: i64 = 915;
+//! const FREQUENCY: i64 = 868_100_000;
 //!
 //! fn main(){
 //!
@@ -48,7 +48,7 @@
 //!         spi, cs, reset,  FREQUENCY, Delay)
 //!         .expect("Failed to communicate with radio module!");
 //!
-//!     lora.set_tx_power(17,1); //Using PA_BOOST. See your board for correct pin.
+//!     lora.set_tx_power(14,1); //Using PA_BOOST. See your board for correct pin.
 //!
 //!     let message = "Hello, world!";
 //!     let mut buffer = [0;255];
@@ -193,6 +193,12 @@ const VERSION_CHECK: u8 = 0x12;
 #[cfg(feature = "version_0x09")]
 const VERSION_CHECK: u8 = 0x09;
 
+/// Calculates the symbol time in µs when given SpreadFactor and BandWidth
+pub fn calc_symbol_time_us(sf: u8, bw: BwSetting) -> u32 {
+    let spow = 1 << sf as u32; // (2.pow(sf))
+    (1_000_000 * (spow + 32)) / bw.as_hz() // +32 'magic' from the datasheet
+}
+
 impl<SPI, CS, RESET, E> LoRa<SPI, CS, RESET>
 where
     SPI: Transfer<u8, Error = E> + Write<u8, Error = E>,
@@ -239,10 +245,18 @@ where
 
             sx127x.write_register(RegSyncWord, 0x34)?; // LoRaWAN public sync word
 
+            sx127x.set_mode(RadioMode::Stdby)?; // Need to go via Stdby, else ~2mA current draw.
+            sx127x.set_mode(RadioMode::Sleep)?;
+
             Ok(sx127x)
         } else {
             Err(Error::VersionMismatch(version))
         }
+    }
+
+    pub fn free(mut self) -> Result<(SPI, CS, RESET), Error<E, CS::Error, RESET::Error>> {
+        self.set_mode(RadioMode::Sleep)?;
+        Ok((self.spi, self.cs, self.reset))
     }
 
     pub fn transmit_payload(
@@ -290,6 +304,7 @@ where
             RegIrqFlagsMask,
             (IRQ::ValidHeader as u8 | IRQ::RxDone as u8) ^ 0xff,
         )?;
+
         // self.write_register(REG_DIO_MAPPING_1, DIO0(00) | DIO1(3) | DIO2(3) | DIO3(1)); // Valid header (dio2) and rxdone (dio0)
 
         let base_ad = self.read_register(RegFifoRxBaseAddr)?;
@@ -439,6 +454,7 @@ where
         } else {
             self.set_implicit_header_mode()?;
         }
+
         self.write_register(
             RegOpMode,
             RadioMode::LongRangeMode.as_value() | mode.as_value(),
@@ -557,14 +573,28 @@ where
         self.write_register(RegModemConfig1, (modem_config_1 & 0xf1) | (cr << 1))
     }
 
-    /// Sets the preamble length of the radio. Values are between 6 and 65535.
-    /// Default value is `8`.
+    /// Reads the coding rate of the radio with the numerator fixed at 4.
+    pub fn get_coding_rate_4(&mut self) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
+        let modem_config_1 = self.read_register(RegModemConfig1)?;
+        Ok(((modem_config_1 & 0x0f) >> 1) + 4)
+    }
+
+    /// Sets the programmable preamble length of the radio (in symbols). Values are between 6 and 65535.
+    /// Default value is `8`, total 'real' preamble time is Tsym * (preamble_length + 4.25)
     pub fn set_preamble_length(
         &mut self,
-        length: i64,
+        length: u16,
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
         self.write_register(RegPreambleMsb, (length >> 8) as u8)?;
-        self.write_register(RegPreambleLsb, length as u8)
+        self.write_register(RegPreambleLsb, (length & 0xff) as u8)
+    }
+
+    /// Gets the programmable preamble length (in symbols).
+    pub fn get_preamble_length(&mut self) -> Result<u16, Error<E, CS::Error, RESET::Error>> {
+        let msb = self.read_register(RegPreambleMsb)? as u16;
+        let lsb = self.read_register(RegPreambleLsb)? as u16;
+
+        Ok((msb << 8) | lsb)
     }
 
     /// Enables are disables the radio's CRC check. Default value is `false`.
@@ -636,6 +666,23 @@ where
         Ok(())
     }
 
+    /// Calculates the symbol time in µs from current radio configuration
+    pub fn get_symbol_time_us(&mut self) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
+        let bw = self.get_signal_bandwidth()?;
+        let sf = self.get_spreading_factor()?;
+        Ok(calc_symbol_time_us(sf, bw))
+    }
+    /// Calculates the symbol time in µs from current radio configuration
+    pub fn get_data_rate_bps(&mut self) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
+        let bw = self.get_signal_bandwidth()?.as_hz();
+        let sf = self.get_spreading_factor()? as u32;
+        let cr = self.get_coding_rate_4()? as u32;
+
+        let dr = (sf * (bw / (1 << sf)) * 4) / cr;
+
+        Ok(dr)
+    }
+
     /// Returns the spreading factor of the radio.
     pub fn get_spreading_factor(&mut self) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
         Ok(self.read_register(RegModemConfig2)? >> 4)
@@ -651,12 +698,12 @@ where
 
     /// Returns the RSSI of the last received packet.
     pub fn get_packet_rssi(&mut self) -> Result<i32, Error<E, CS::Error, RESET::Error>> {
-        Ok(i32::from(self.read_register(RegPktRssiValue)?) - 157)
+        Ok(i32::from(self.read_register(RegPktRssiValue)?) - 157) // -139 for SX1272
     }
 
     /// Returns the signal to noise radio of the the last received packet.
-    pub fn get_packet_snr(&mut self) -> Result<f64, Error<E, CS::Error, RESET::Error>> {
-        Ok(f64::from(self.read_register(RegPktSnrValue)?))
+    pub fn get_packet_snr(&mut self) -> Result<f32, Error<E, CS::Error, RESET::Error>> {
+        Ok(f32::from(self.read_register(RegPktSnrValue)?) / 4.0)
     }
 
     /// Returns the frequency error of the last received packet in Hz.
