@@ -154,15 +154,16 @@ use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 
 mod register;
-pub use register::{BwSetting, FskDataModulationShaping, FskRampUpRamDown, PaConfig, RadioMode};
-use register::{
-    Register::{self, *},
-    IRQ,
+pub use register::{
+    BwSetting, FskDataModulationShaping, FskRampUpRamDown, IrqFlags, PaConfig, RadioMode,
 };
+use register::{Register::*, IRQ};
 
 use Error::*;
 
-pub const MODE: Mode = Mode {
+pub const FIFO_SIZE: usize = 256;
+
+pub const SPI_MODE: Mode = Mode {
     phase: Phase::CaptureOnSecondTransition,
     polarity: Polarity::IdleHigh,
 };
@@ -171,7 +172,7 @@ pub struct LoRa<SPI, CS, RESET> {
     spi: SPI,
     cs: CS,
     reset: RESET,
-    freq_hz: i64,
+    freq_hz: u32,
     pub explicit_header: bool,
     pub mode: RadioMode,
 }
@@ -179,6 +180,7 @@ pub struct LoRa<SPI, CS, RESET> {
 #[derive(Debug)]
 pub enum Error<SPI, CS, RESET> {
     Uninformative,
+    RxTimeout,
     VersionMismatch(u8),
     CS(CS),
     Reset(RESET),
@@ -199,6 +201,11 @@ pub fn calc_symbol_time_us(sf: u8, bw: BwSetting) -> u32 {
     (1_000_000 * (spow + 32)) / bw.as_hz() // +32 'magic' from the datasheet
 }
 
+pub fn calc_data_rate(sf: u8, bw: BwSetting, cr: u8) -> u32 {
+    let sf = sf as u32;
+    (sf * (bw.as_hz() / (1 << sf)) * 4) / cr as u32
+}
+
 impl<SPI, CS, RESET, E> LoRa<SPI, CS, RESET>
 where
     SPI: Transfer<u8, Error = E> + Write<u8, Error = E>,
@@ -208,7 +215,7 @@ where
     /// Builds and returns a new instance of the radio. Only one instance of the radio should exist at a time.
     /// This also preforms a hardware reset of the module and then puts it in standby.
     pub fn new(
-        freq_hz: i64,
+        freq_hz: u32,
         spi: SPI,
         cs: CS,
         reset: RESET,
@@ -259,139 +266,206 @@ where
         Ok((self.spi, self.cs, self.reset))
     }
 
-    pub fn transmit_payload(
+    pub fn transmit_blocking(
         &mut self,
         payload: &[u8],
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        if self.transmitting()? {
+        self.transmit_nb(payload)?;
+        while self.is_transmitting()? {}
+        Ok(())
+    }
+
+    pub fn transmit_nb(&mut self, payload: &[u8]) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+        if self.is_transmitting()? {
             Err(Transmitting)
         } else {
             self.set_mode(RadioMode::Stdby)?;
-            if self.explicit_header {
-                self.set_explicit_header_mode()?;
-            } else {
-                self.set_implicit_header_mode()?;
-            }
 
-            self.write_register(RegIrqFlags, 0xff)?;
-            self.write_register(RegIrqFlagsMask, IRQ::TxDone.as_value() ^ 0xff)?;
+            self.clear_irq_flags()?;
+            self.write_register(RegIrqFlagsMask, IRQ::TxDone.as_byte() ^ 0xff)?;
             self.write_register(RegDioMapping1, 0x40 | 0x30 | 0xc0)?;
 
-            let base_ad = self.read_register(RegFifoRxBaseAddr)?;
-            self.write_register(RegFifoAddrPtr, base_ad)?;
+            self.write_register(RegFifoTxBaseAddr, 0)?;
+            self.write_register(RegFifoAddrPtr, 0)?;
             self.write_register(RegPayloadLength, payload.len().min(255) as u8)?;
 
             for &byte in payload.iter().take(255) {
                 self.write_register(RegFifo, byte)?;
             }
 
-            self.set_mode(RadioMode::Tx)?;
-
-            while self.transmitting()? {}
-            Ok(())
+            self.set_mode(RadioMode::Tx)
         }
     }
 
-    /// Todo: replace this and `poll_irq` for something sane!
-    /// Short wait for validheader and some time for receiving
-    pub fn my_rx(
+    /// Blocking RX of a single packet. This function needs to be called *on time*, exactly when a packet is expected
+    /// It returns the size of a packet if Rx was successful. An error is returned if the RX task timed out.
+    pub fn polled_rx_single(
         &mut self,
-        timeout_ms: Option<i32>,
         delay: &mut dyn DelayMs<u8>,
-    ) -> Result<usize, Error<E, CS::Error, RESET::Error>> {
-        self.write_register(RegIrqFlags, 0xff)?;
+    ) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
+        self.write_register(RegFifoRxBaseAddr, 0)?; // start writing FIFO from the bottom, so we can use the full 256 bytes FIFO capacity
+        self.clear_irq_flags()?;
         self.write_register(
             RegIrqFlagsMask,
-            (IRQ::ValidHeader as u8 | IRQ::RxDone as u8) ^ 0xff,
+            (IRQ::ValidHeader.as_byte() | IRQ::RxDone.as_byte()) ^ 0xff,
         )?;
 
-        // self.write_register(REG_DIO_MAPPING_1, DIO0(00) | DIO1(3) | DIO2(3) | DIO3(1)); // Valid header (dio2) and rxdone (dio0)
+        self.set_mode(RadioMode::RxSingle)?;
 
-        let base_ad = self.read_register(RegFifoRxBaseAddr)?;
-        self.write_register(RegFifoAddrPtr, base_ad)?;
+        let mut total_rx_timeout_ms = (FIFO_SIZE as u32 * 10 * 1000) / self.get_data_rate_bps()?; // fifo_size * 10; 10-bit-bytes to add some leeway/margin
+        let mut header_timeout_ms = 175; // iets met symbolrate / preamble / header size
 
-        self.poll_irq(timeout_ms, delay)
+        // Wait/poll for valid header
+        while header_timeout_ms > 0 && !self.read_irq_flags()?.valid_header() {
+            header_timeout_ms -= 1;
+            delay.delay_ms(1);
+        }
+
+        defmt::debug!("polled_rx_single: after wait for header:\nflags {}, header_timeout_left_ms {}ms, total_rx_timeout_ms: {}ms",
+        defmt::Debug2Format(&self.read_irq_flags()?),
+            header_timeout_ms,
+            total_rx_timeout_ms,
+        );
+
+        // Yes we have received a valid header!
+        let result = if self.read_irq_flags()?.valid_header() {
+            while total_rx_timeout_ms > 0 && !self.read_irq_flags()?.rx_done() {
+                total_rx_timeout_ms -= 1;
+                delay.delay_ms(1);
+            }
+
+            if self.read_irq_flags()?.rx_done() {
+                self.print_fifo_info("in polled_rx_single")?;
+                Ok(self.get_rx_packet_size()?)
+            } else {
+                Err(RxTimeout)
+            }
+        } else {
+            Err(RxTimeout)
+        };
+
+        self.set_mode(RadioMode::Stdby)?;
+
+        result
     }
 
     /// Blocks the current thread, returning the size of a packet if one is received or an error is the
     /// task timed out. The timeout can be supplied with None to make it poll indefinitely or
     /// with `Some(timeout_in_mill_seconds)`
-    pub fn poll_irq(
+    pub fn polled_rx(
         &mut self,
         timeout_ms: Option<i32>,
         delay: &mut dyn DelayMs<u8>,
-    ) -> Result<usize, Error<E, CS::Error, RESET::Error>> {
+    ) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
         self.set_mode(RadioMode::RxContinuous)?;
+
         match timeout_ms {
-            Some(value) => {
+            Some(timeout) => {
                 let mut count = 0;
                 let packet_ready = loop {
-                    let irq_flags = self.read_register(RegIrqFlags)?;
-                    let packet_ready = irq_flags.get_bit(6); // valid headeR: | irq_flags.get_bit(4);
+                    let packet_ready = self.read_irq_flags()?.rx_done(); // valid headeR: | irq_flags.get_bit(4);
 
-                    if count >= value || packet_ready {
+                    if count >= timeout || packet_ready {
                         break packet_ready;
                     }
                     count += 1;
                     delay.delay_ms(1);
                 };
+
                 if packet_ready {
-                    self.clear_irq()?;
-                    Ok(self.read_register(RegRxNbBytes)? as usize)
+                    self.clear_irq_flags()?;
+                    Ok(self.get_rx_packet_size()?)
                 } else {
                     Err(Uninformative)
                 }
             }
             None => {
-                while !self.read_register(RegIrqFlags)?.get_bit(6) {
-                    delay.delay_ms(100);
+                while !self.read_irq_flags()?.rx_done() {
+                    delay.delay_ms(10);
                 }
-                self.clear_irq()?;
-                Ok(self.read_register(RegRxNbBytes)? as usize)
+                self.clear_irq_flags()?;
+                Ok(self.get_rx_packet_size()?)
             }
         }
     }
 
-    /// Returns the contents of the fifo as a fixed 255 u8 array. This should only be called if there is a
-    /// new packet ready to be read.
-    pub fn read_packet(&mut self) -> Result<[u8; 255], Error<E, CS::Error, RESET::Error>> {
-        let mut buffer = [0 as u8; 255];
-        self.clear_irq()?;
-        let size = self.get_ready_packet_size()?;
-        let fifo_addr = self.read_register(RegFifoRxCurrentAddr)?;
-        self.write_register(RegFifoAddrPtr, fifo_addr)?;
+    /// Writes content in the given buffer and returns a slice into the buffer containing the
+    /// This should only be called if there is a new packet ready to be read.
+    pub fn read_rx_fifo_into<'a, const N: usize>(
+        &mut self,
+        buffer: &'a mut [u8; N],
+    ) -> Result<&'a [u8], Error<E, CS::Error, RESET::Error>> {
+        self.clear_irq_flags()?;
+        self.print_fifo_info("read packet")?;
+        let size = self.get_rx_packet_size()?;
+
+        // Set read pointer to RxBase (start of reception) pointer in the FIFO
+        let rx_base_ptr = self.read_register(RegFifoRxBaseAddr)?;
+        self.write_register(RegFifoAddrPtr, rx_base_ptr)?;
+        self.print_fifo_info("read packet")?;
+
         for i in 0..size {
             let byte = self.read_register(RegFifo)?;
             buffer[i as usize] = byte;
         }
-        self.write_register(RegFifoAddrPtr, 0)?;
+        // self.write_register(RegFifoAddrPtr, 0)?;
+
+        Ok(&buffer[..size as usize])
+    }
+
+    /// Returns the contents of the fifo as a [u8; 256]
+    /// This should only be called if there is a new packet ready to be read.
+    pub fn read_rx_fifo(&mut self) -> Result<[u8; 256], Error<E, CS::Error, RESET::Error>> {
+        let mut buffer = [0 as u8; 256];
+        self.read_rx_fifo_into(&mut buffer)?;
         Ok(buffer)
     }
 
     /// Returns size of a packet read into FIFO. This should only be calle if there is a new packet
     /// ready to be read.
-    pub fn get_ready_packet_size(&mut self) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
+    pub fn get_rx_packet_size(&mut self) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
         self.read_register(RegRxNbBytes)
     }
 
     /// Returns true if the radio is currently transmitting a packet.
-    pub fn transmitting(&mut self) -> Result<bool, Error<E, CS::Error, RESET::Error>> {
+    pub fn is_transmitting(&mut self) -> Result<bool, Error<E, CS::Error, RESET::Error>> {
         let op_mode = self.read_register(RegOpMode)? & 0x7;
 
-        if (op_mode == RadioMode::Tx.as_value()) || (op_mode == RadioMode::FsTx.as_value()) {
+        if (op_mode == RadioMode::Tx.as_byte()) || (op_mode == RadioMode::FsTx.as_byte()) {
             Ok(true)
         } else {
-            if (self.read_register(RegIrqFlags)? & (IRQ::TxDone as u8)) == 1 {
-                self.write_register(RegIrqFlags, IRQ::TxDone as u8)?;
+            if self.read_irq_flags()?.rx_done() {
+                self.write_register(RegIrqFlags, IRQ::TxDone.as_byte())?;
             }
             Ok(false)
         }
     }
 
+    pub fn print_fifo_info(
+        &mut self,
+        prefix: &str,
+    ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+        let fifo_addr = self.read_register(RegFifoAddrPtr)?; // fifo host pointer
+        let rx_current = self.read_register(RegFifoRxCurrentAddr)?; // fifo
+        let rx_base = self.read_register(RegFifoRxBaseAddr)?; // fifo
+        let tx_base = self.read_register(RegFifoTxBaseAddr)?; // Modem tx add
+
+        defmt::error!(
+            "\n\n SX1276 FIFO info!: ({})\nfifo_addr: {}, rx_current {}, rx_base {}, tx_base {}",
+            prefix,
+            fifo_addr,
+            rx_current,
+            rx_base,
+            tx_base
+        );
+        Ok(())
+    }
+
     /// Clears the radio's IRQ registers.
-    pub fn clear_irq(&mut self) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        let irq_flags = self.read_register(RegIrqFlags)?;
-        self.write_register(RegIrqFlags, irq_flags)
+    pub fn clear_irq_flags(&mut self) -> Result<(), Error<E, CS::Error, RESET::Error>> {
+        // let irq_flags = self.read_irq_flags()?;
+        // self.write_register(RegIrqFlags, irq_flags.as_byte())
+        self.write_register(RegIrqFlags, 0xff)
     }
 
     /// Sets the transmit power and pin. Levels can range from 0-14 when the output
@@ -402,7 +476,7 @@ where
         mut level: i32,
         output_pin: u8,
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        if PaConfig::PaOutputRfoPin.as_value() == output_pin {
+        if PaConfig::PaOutputRfoPin.as_byte() == output_pin {
             // RFO
             if level < 0 {
                 level = 0;
@@ -431,7 +505,7 @@ where
                 self.set_ocp(100)?;
             }
             level -= 2;
-            self.write_register(RegPaConfig, PaConfig::PaBoost.as_value() | level as u8)
+            self.write_register(RegPaConfig, PaConfig::PaBoost.as_byte() | level as u8)
         }
     }
 
@@ -457,7 +531,7 @@ where
 
         self.write_register(
             RegOpMode,
-            RadioMode::LongRangeMode.as_value() | mode.as_value(),
+            RadioMode::LongRangeMode.as_byte() | mode.as_byte(),
         )?;
 
         self.mode = mode;
@@ -472,16 +546,41 @@ where
     ///
     pub fn set_frequency(
         &mut self,
-        freq_hz: i64,
+        freq_hz: u32,
     ) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
         self.freq_hz = freq_hz;
-        let frf = (freq_hz << 19) / 32_000_000;
+        let frf = ((freq_hz as i64) << 19) / 32_000_000;
         self.write_register(RegFrfMsb, ((frf >> 16) & 0xff) as u8)?;
         self.write_register(RegFrfMid, ((frf >> 8) & 0xff) as u8)?;
         self.write_register(RegFrfLsb, ((frf >> 0) & 0xff) as u8)?;
 
         let actual = (frf * 32_000_000) >> 19;
         Ok(actual as u32)
+    }
+
+    /// Gets observed frequency error in Hertz
+    pub fn get_freq_error_hz(&mut self) -> Result<i32, Error<E, CS::Error, RESET::Error>> {
+        let fei = self.get_fei_value()? as i64;
+        let bw = self.get_signal_bandwidth()?.as_hz() as i64;
+
+        // See page 4.1.5 (pag. 37) of Semtech sx1276 datasheet (rev.7)
+        let err_hz = (fei * (1 << 24) * bw) / (32_000_000 * 500_000);
+
+        Ok(err_hz as i32)
+    }
+
+    /// Gets raw 20bit frequency error (FEI) value
+    pub fn get_fei_value(&mut self) -> Result<i32, Error<E, CS::Error, RESET::Error>> {
+        let lsb = self.read_register(RegFreqErrorLsb)?;
+        let mid = self.read_register(RegFreqErrorMid)?;
+        let msb = self.read_register(RegFreqErrorMsb)?;
+
+        let n_msb: u8 = msb << 4 | mid >> 4;
+        let n_mid: u8 = mid << 4 | lsb >> 4;
+        let n_lsb: u8 = lsb << 4;
+        let fei_value = i32::from_be_bytes([n_msb, n_mid, n_lsb, 0]) >> 12; // 20bit 2's complement, expect bit shift to sign-extend
+
+        Ok(fei_value)
     }
 
     /// Sets the radio to use an explicit header. Default state is `ON`.
@@ -607,17 +706,6 @@ where
         }
     }
 
-    // /// Inverts the radio's IQ signals. Default value is `false`.
-    // pub fn set_invert_iq(&mut self, value: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-    //     if value {
-    //         self.write_register(RegInvertiq, 0x66)?;
-    //         self.write_register(RegInvertiq2, 0x19)
-    //     } else {
-    //         self.write_register(RegInvertiq, 0x27)?;
-    //         self.write_register(RegInvertiq2, 0x1d)
-    //     }
-    // }
-
     pub fn invert_rx_iq(&mut self, inv: bool) -> Result<(), Error<E, CS::Error, RESET::Error>> {
         let mut regiq = self.read_register(RegInvertiq)?
             & register::RFLR_INVERTIQ_TX_MASK
@@ -666,21 +754,21 @@ where
         Ok(())
     }
 
-    /// Calculates the symbol time in µs from current radio configuration
+    /// Calculates the symbol time in µs from current radio setup
     pub fn get_symbol_time_us(&mut self) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
         let bw = self.get_signal_bandwidth()?;
         let sf = self.get_spreading_factor()?;
+
         Ok(calc_symbol_time_us(sf, bw))
     }
-    /// Calculates the symbol time in µs from current radio configuration
+
+    /// Reads and calculates data rate in bytes/s from current radio setup
     pub fn get_data_rate_bps(&mut self) -> Result<u32, Error<E, CS::Error, RESET::Error>> {
-        let bw = self.get_signal_bandwidth()?.as_hz();
-        let sf = self.get_spreading_factor()? as u32;
-        let cr = self.get_coding_rate_4()? as u32;
+        let bw = self.get_signal_bandwidth()?;
+        let sf = self.get_spreading_factor()?;
+        let cr = self.get_coding_rate_4()?;
 
-        let dr = (sf * (bw / (1 << sf)) * 4) / cr;
-
-        Ok(dr)
+        Ok(calc_data_rate(sf, bw, cr))
     }
 
     /// Returns the spreading factor of the radio.
@@ -734,31 +822,41 @@ where
         self.write_register(RegModemConfig3, config_3)
     }
 
-    fn read_register(&mut self, reg: Register) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
+    pub fn read_irq_flags(&mut self) -> Result<IrqFlags, Error<E, CS::Error, RESET::Error>> {
+        let irq_flags = self.read_register(RegIrqFlags)?;
+        Ok(irq_flags.into())
+    }
+
+    fn read_register<REG: Into<u8>>(
+        &mut self,
+        reg: REG,
+    ) -> Result<u8, Error<E, CS::Error, RESET::Error>> {
         self.cs.set_low().map_err(CS)?;
 
-        let mut buffer = [reg.as_value() & 0x7f, 0];
+        let mut buffer = [reg.into() & 0x7f, 0];
         let transfer = self.spi.transfer(&mut buffer).map_err(SPI)?;
         self.cs.set_high().map_err(CS)?;
+
         Ok(transfer[1])
     }
 
-    fn write_register(
+    fn write_register<REG: Into<u8>>(
         &mut self,
-        reg: Register,
+        reg: REG,
         byte: u8,
     ) -> Result<(), Error<E, CS::Error, RESET::Error>> {
         self.cs.set_low().map_err(CS)?;
 
-        let buffer = [reg.as_value() | 0x80, byte];
+        let buffer = [reg.into() | 0x80, byte];
         self.spi.write(&buffer).map_err(SPI)?;
         self.cs.set_high().map_err(CS)?;
+
         Ok(())
     }
 
     pub fn put_in_fsk_mode(&mut self) -> Result<(), Error<E, CS::Error, RESET::Error>> {
-        // Put in FSK mode
         let mut op_mode: u8 = 0x0;
+
         op_mode
             .set_bit(7, false) // FSK mode
             .set_bits(5..6, 0x00) // FSK modulation

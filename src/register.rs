@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use core::convert::TryFrom;
+use bit_field::BitField;
+use core::{convert::TryFrom, fmt::Debug};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Register {
@@ -46,12 +47,128 @@ pub enum Register {
 
 impl From<Register> for u8 {
     fn from(mode: Register) -> Self {
-        mode.as_value()
+        mode.as_byte()
     }
 }
 
 impl Register {
-    pub fn as_value(self) -> u8 {
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+pub struct IrqFlags(u8);
+
+impl From<IrqFlags> for u8 {
+    fn from(value: IrqFlags) -> Self {
+        value.0
+    }
+}
+
+impl From<u8> for IrqFlags {
+    fn from(value: u8) -> Self {
+        IrqFlags(value)
+    }
+}
+
+impl IrqFlags {
+    pub fn as_byte(self) -> u8 {
+        self.0
+    }
+
+    pub fn is_set(&self, irq: IRQ) -> bool {
+        self.0 & irq.as_byte() != 0
+    }
+
+    pub fn rx_timeout(&self) -> bool {
+        self.0.get_bit(7)
+    }
+
+    pub fn rx_done(&self) -> bool {
+        self.0.get_bit(6)
+    }
+
+    pub fn payload_crc_error(&self) -> bool {
+        self.0.get_bit(5)
+    }
+
+    pub fn valid_header(&self) -> bool {
+        self.0.get_bit(4)
+    }
+
+    pub fn tx_done(&self) -> bool {
+        self.0.get_bit(3)
+    }
+
+    pub fn cad_done(&self) -> bool {
+        self.0.get_bit(2)
+    }
+
+    pub fn fhss_change_channel(&self) -> bool {
+        self.0.get_bit(1)
+    }
+
+    pub fn cad_detected(&self) -> bool {
+        self.0.get_bit(0)
+    }
+}
+
+impl Debug for IrqFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "IrqFlags({}) ", self.as_byte())?;
+
+        let mut set = f.debug_set();
+
+        if self.cad_detected() {
+            set.entry(&"cad_detected");
+        }
+        if self.cad_done() {
+            set.entry(&"cad_done");
+        }
+        if self.fhss_change_channel() {
+            set.entry(&"fhss_change_channel");
+        }
+        if self.payload_crc_error() {
+            set.entry(&"payload_crc_error");
+        }
+        if self.rx_done() {
+            set.entry(&"rx_done");
+        }
+        if self.rx_timeout() {
+            set.entry(&"rx_timeout");
+        }
+        if self.tx_done() {
+            set.entry(&"tx_done");
+        }
+        if self.valid_header() {
+            set.entry(&"valid_header");
+        }
+
+        set.finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IRQ {
+    RxTimeOut = (1 << 7),
+    RxDone = (1 << 6),
+    PayloadCrcError = (1 << 5),
+    ValidHeader = (1 << 4),
+    TxDone = (1 << 3),
+    CadDone = (1 << 2),
+    FHSSChangeChannel = (1 << 1),
+    CadDetected = (1 << 0),
+}
+
+impl From<IRQ> for u8 {
+    fn from(mode: IRQ) -> Self {
+        mode.as_byte()
+    }
+}
+
+impl IRQ {
+    pub fn as_byte(self) -> u8 {
         self as u8
     }
 }
@@ -70,13 +187,13 @@ pub enum RadioMode {
 
 impl From<RadioMode> for u8 {
     fn from(mode: RadioMode) -> Self {
-        mode.as_value()
+        mode.as_byte()
     }
 }
 
 impl RadioMode {
     /// Returns the address of the mode.
-    pub fn as_value(self) -> u8 {
+    pub fn as_byte(self) -> u8 {
         self as u8
     }
 }
@@ -107,36 +224,12 @@ pub enum PaConfig {
 
 impl From<PaConfig> for u8 {
     fn from(mode: PaConfig) -> Self {
-        mode.as_value()
+        mode.as_byte()
     }
 }
 
 impl PaConfig {
-    pub fn as_value(self) -> u8 {
-        self as u8
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum IRQ {
-    RxTimeOut = (1 << 7),
-    RxDone = (1 << 6),
-    PayloadCrcError = (1 << 5),
-    ValidHeader = (1 << 4),
-    TxDone = (1 << 3),
-    CadDone = (1 << 2),
-    FHSSChangeChannel = (1 << 1),
-    CadDetected = (1 << 0),
-}
-
-impl From<IRQ> for u8 {
-    fn from(mode: IRQ) -> Self {
-        mode.as_value()
-    }
-}
-
-impl IRQ {
-    pub fn as_value(self) -> u8 {
+    pub fn as_byte(self) -> u8 {
         self as u8
     }
 }
